@@ -1,5 +1,7 @@
 import tensorflow_datasets as tfds
 import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from matplotlib import pyplot as plt
 
 
 # Load EMNIST Balanced dataset
@@ -11,41 +13,112 @@ import tensorflow as tf
     with_info=True
 )
 
+# Load dataset from dirs
+dataset_dir = "dataset"
 
-# augment = tf.keras.Sequential([
-#     tf.keras.layers.RandomRotation(0.1)  # Rotates ±10% of 360° → ~±36°
-# ])
+# Load training dataset without resizing
+ds_train2 = tf.keras.utils.image_dataset_from_directory(
+    dataset_dir,
+    validation_split=0.1,
+    subset="training",
+    seed=123,
+    image_size=(28, 28),               # Still required, but won't resize if already 28x28
+    batch_size=None,
+    color_mode='grayscale'             # Important for EMNIST-style data
+)
 
-# def augment(image, label):
-#     # Random rotate by 20-degree intervals
-#     image = tf.image.rot90(image, k=tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32))
-#     image = tf.keras.layers.RandomRotation(0.1)
-#     return image, label
+# Load validation dataset
+ds_test2 = tf.keras.utils.image_dataset_from_directory(
+    dataset_dir,
+    validation_split=0.1,
+    subset="validation",
+    seed=123,
+    image_size=(28, 28),
+    batch_size=None,
+    color_mode='grayscale'
+)
+
+
+class DummyFeatures:
+    def __init__(self, class_names):
+        self.label = self.Label(class_names)
+
+    class Label:
+        def __init__(self, class_names):
+            self.num_classes = len(class_names)
+            self.names = class_names
+
+class DummyDSInfo:
+    def __init__(self, class_names):
+        self.features = {'label': DummyFeatures(class_names).label}
+
+class_names = ds_train2.class_names
+ds_info2 = DummyDSInfo(class_names)
+
+
+def transpose_image(image, label):
+    # Rotate 90 CW and invert horizontally
+    return tf.transpose(image, perm=[1, 0, 2]), label
 
 # Normalize and batch the data
 def preprocess(image, label):
-
-    # Rotate 90 CW and invert horizontally
-    image = tf.transpose(image, perm=[1, 0, 2])
-
     image = tf.cast(image, tf.float32) / 255.0
     image = tf.expand_dims(image, -1)  # Add channel dimension
     return image, label
 
 batch_size = 128
 
-ds_train = ds_train.map(preprocess).shuffle(1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-ds_test = ds_test.map(preprocess).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+ds_train = ds_train.map(transpose_image).map(preprocess).shuffle(1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+ds_test = ds_test.map(transpose_image).map(preprocess).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+ds_train2 = ds_train2.map(preprocess).shuffle(1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+ds_test2 = ds_test2.map(preprocess).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 # Show an example
 # import matplotlib.pyplot as plt
-# plt.figure(figsize=(5, 5))
-# plt.imshow(ds_train.take(1).as_numpy_iterator().next()[0][0].squeeze(), cmap='gray')
-# plt.show()
+
+def show_example(ds, target_label):
+    for image_batch, label_batch in ds.unbatch():
+        if label_batch.numpy() == target_label:
+            image = image_batch.numpy().squeeze()
+            plt.figure(figsize=(5, 5))
+            plt.imshow(image, cmap='gray')
+            plt.title(f"Found label: {target_label}")
+            plt.show()
+            break
+
+# target_label = 17
+# show_example(ds_train, target_label)
+# show_example(ds_train2, target_label)
+# import sys;sys.exit()
+
+
+# Callbacks
+checkpoint_cb = ModelCheckpoint(
+    "best_model.h5",  # Save path
+    save_best_only=True,
+    monitor="val_accuracy",  # You can use 'val_loss' too
+    mode="max",
+    verbose=1
+)
+
+earlystop_cb = EarlyStopping(
+    monitor="val_accuracy",
+    patience=3,  # Stop after 3 epochs without improvement
+    mode="max",
+    restore_best_weights=True,  # Restore weights of the best epoch
+    verbose=1
+)
+
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomRotation(0.1)  # Rotate up to ±10% of 180° (i.e., ±18°)
+])
+
 
 # Model definition
 model = tf.keras.Sequential([
     tf.keras.layers.Input(shape=(28, 28, 1)),
+    data_augmentation,  # <- applies only during training
     tf.keras.layers.Conv2D(32, 3, activation='relu'),
     tf.keras.layers.MaxPooling2D(),
     tf.keras.layers.Conv2D(64, 3, activation='relu'),
@@ -59,18 +132,29 @@ model = tf.keras.Sequential([
 model.compile(
     optimizer='adam',
     loss='sparse_categorical_crossentropy',
-    metrics=['accuracy']
+    metrics=['accuracy'],
 )
 
+
+# Load the best model from checkpoint
+#model.load_weights("emnist_trained.h5")
+
 # Train the model
-model.fit(ds_train, epochs=5, validation_data=ds_test)
+model.fit(ds_train, epochs=40, validation_data=ds_test2
+        , callbacks=[checkpoint_cb, earlystop_cb])
+
+model.fit(ds_train2, epochs=40, validation_data=ds_test2
+        , callbacks=[checkpoint_cb, earlystop_cb])
+
+# Load the best model from checkpoint
+best_model = tf.keras.models.load_model("best_model.h5")
 
 # Convert to TensorFlow Lite
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter = tf.lite.TFLiteConverter.from_keras_model(best_model)
 tflite_model = converter.convert()
 
 # Save the .tflite model
-with open("emnist_model.tflite", "wb") as f:
+with open("enmist_model.tflite", "wb") as f:
     f.write(tflite_model)
 
 print("✅ Model trained and exported as emnist_model.tflite")
